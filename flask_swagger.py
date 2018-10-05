@@ -121,8 +121,107 @@ def _extract_definitions(alist, level=None):
     return defs
 
 
-def swagger(app, prefix=None, process_doc=_sanitize,
-            from_file_keyword=None, template=None):
+def _flatten_iterable(x, ignored_types=None):
+    if ignored_types is None:
+        ignored_types = [dict, basestring]
+    result = []
+    for el in x:
+        if hasattr(el, "__iter__") and not any([isinstance(el, t) for t in ignored_types]):
+            result.extend(_flatten_iterable(el))
+        else:
+            result.append(el)
+    return result
+
+
+def swagger(app, prefix=None, process_doc=_sanitize, from_file_keyword=None, template=None):
+    if app.__class__.__name__ == 'WSGIApplication':
+        calling_func = swagger_webapp2
+    else:
+        calling_func = swagger_flask
+    return calling_func(app, prefix, process_doc, from_file_keyword, template)
+
+
+def swagger_webapp2(app, prefix=None, process_doc=_sanitize, from_file_keyword=None, template=None):
+    """
+    Generate a swagger spec from a webapp2 application.
+    """
+    output = {
+        "swagger": "2.0",
+        "info": {
+            "version": "0.0.0",
+            "title": "Cool product name",
+        }
+    }
+    paths = defaultdict(dict)
+    definitions = defaultdict(dict)
+    if template is not None:
+        output.update(template)
+        for k, v in output.get('paths', {}).items():
+            paths[k] = v
+        for k, v in output.get('definitions', {}).items():
+            definitions[k] = v
+    output["paths"] = paths
+    output["definitions"] = definitions
+
+    optional_fields = ['tags', 'consumes', 'produces', 'schemes', 'security',
+                       'deprecated', 'operationId', 'externalDocs']
+
+    router = app.router
+    if hasattr(router, 'match_routes'):
+        routes = router.match_routes
+    else:
+        routes = list(router.get_routes())
+    routes = _flatten_iterable(routes)
+    for route in routes:
+        if hasattr(route, 'handler'):
+            if prefix and route.template[:len(prefix)] != prefix:
+                continue
+            methods = dict()
+            verbs = [m[0] for m in inspect.getmembers(route.handler, predicate=inspect.ismethod)
+                     if m[0] in ['get', 'post', 'put', 'delete']]
+            for verb in verbs:
+                methods[verb] = getattr(route.handler, verb)
+
+            operations = dict()
+            for verb, method in methods.items():
+                summary, description, swag = _parse_docstring(method, process_doc, from_file_keyword)
+                if swag is not None:
+                    defs = swag.get('definitions', [])
+                    defs = _extract_definitions(defs)
+                    params = swag.get('parameters', [])
+                    defs += _extract_definitions(params)
+                    responses = swag.get('responses', {})
+                    responses = {
+                        str(key): value
+                        for key, value in responses.items()
+                    }
+                    if responses is not None:
+                        defs = defs + _extract_definitions(responses.values())
+                    for definition in defs:
+                        def_id = definition.pop('id')
+                        if def_id is not None:
+                            definitions[def_id].update(definition)
+                    operation = dict(
+                        summary=summary,
+                        description=description,
+                        responses=responses
+                    )
+                    if len(params) > 0:
+                        operation['parameters'] = params
+                    for key in optional_fields:
+                        if key in swag:
+                            operation[key] = swag.get(key)
+                    operations[verb] = operation
+
+            if len(operations):
+                template = route.template.lstrip('^').rstrip('$')
+                for i, match in enumerate(re.findall(r'(\([^)]*\))', template)):
+                    template = template.replace(match, '{arg%d}' % (i+1), 1)
+                paths[template].update(operations)
+    return output
+
+
+def swagger_flask(app, prefix=None, process_doc=_sanitize, from_file_keyword=None, template=None):
     """
     Call this from an @app.route method like this
     @app.route('/spec.json')
